@@ -1,31 +1,33 @@
-// ════════════════════════════════════════════════════════════════════════════
-//  TF8 TRADING COMPETITION BOT
-//  Stockage : CSV dans un message Discord (canal log privé)
-//  Membres  : tout par boutons, zéro slash command
-//  Admins   : /setup-trading /reset-competition /classement /liste-emails /gagnant
-// ════════════════════════════════════════════════════════════════════════════
-
 require('dotenv').config();
+
 const {
   Client, GatewayIntentBits, Partials,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle,
+  StringSelectMenuBuilder, ModalBuilder,
+  TextInputBuilder, TextInputStyle,
   EmbedBuilder, Events, SlashCommandBuilder,
   REST, Routes, PermissionFlagsBits
 } = require('discord.js');
+
 const axios = require('axios');
 
-// ─── VARIABLES D'ENVIRONNEMENT ───────────────────────────────────────────────
-const TOKEN            = process.env.TOKEN;
-const CLIENT_ID        = process.env.CLIENT_ID;
-const GUILD_ID         = process.env.GUILD_ID;
-const LOG_CHANNEL_ID   = process.env.LOG_CHANNEL_ID;
-const EMAIL_CHANNEL_ID = process.env.EMAIL_CHANNEL_ID;
-const RANK_CHANNEL_ID  = process.env.RANK_CHANNEL_ID;
+const TOKEN = process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
+const RANK_CHANNEL_ID = process.env.RANK_CHANNEL_ID;
 
-const STARTING_CAPITAL = 10000;
+for (const key of [
+  'TOKEN', 'CLIENT_ID', 'GUILD_ID',
+  'LOG_CHANNEL_ID', 'RANK_CHANNEL_ID'
+]) {
+  if (!process.env[key]) {
+    throw new Error(`Missing environment variable: ${key}`);
+  }
+}
 
-// ─── 20 ACTIFS ───────────────────────────────────────────────────────────────
+const STARTING_CAPITAL = 50000;
+
 const ASSETS = {
   BTC:    { name: 'Bitcoin',         source: 'crypto', id: 'bitcoin' },
   ETH:    { name: 'Ethereum',        source: 'crypto', id: 'ethereum' },
@@ -49,107 +51,297 @@ const ASSETS = {
   CADUSD: { name: 'CAD/USD',         source: 'yahoo',  id: 'CAD=X' },
 };
 
-// ─── PRIX TEMPS RÉEL ─────────────────────────────────────────────────────────
 let priceCache = {};
 let lastFetch = 0;
+let fetchInFlight;
 
 async function fetchPrices() {
   if (Date.now() - lastFetch < 60_000) return priceCache;
-  const prices = {};
+  if (fetchInFlight) return fetchInFlight;
 
-  // Crypto → CoinGecko (gratuit, sans clé)
-  const cryptoIds = [...new Set(
-    Object.values(ASSETS).filter(a => a.source === 'crypto').map(a => a.id)
-  )].join(',');
+  fetchInFlight = (async () => {
+    const prices = {};
+    const crypto = Object.entries(ASSETS)
+      .filter(([, asset]) => asset.source === 'crypto');
+    const yahoo = Object.entries(ASSETS)
+      .filter(([, asset]) => asset.source === 'yahoo');
+
+    await Promise.all([
+      (async () => {
+        try {
+          const response = await axios.get(
+            'https://api.coingecko.com/api/v3/simple/price',
+            {
+              params: {
+                ids: crypto.map(([, asset]) => asset.id).join(','),
+                vs_currencies: 'usd'
+              },
+              timeout: 8000
+            }
+          );
+
+          for (const [ticker, asset] of crypto) {
+            const value = response.data?.[asset.id]?.usd;
+            if (Number.isFinite(value) && value > 0) {
+              prices[ticker] = value;
+            }
+          }
+        } catch (_) {
+          console.error('CoinGecko prices unavailable.');
+        }
+      })(),
+
+      ...yahoo.map(async ([ticker, asset]) => {
+        try {
+          const response = await axios.get(
+            `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(asset.id)}`,
+            {
+              params: { interval: '1d', range: '1d' },
+              timeout: 8000,
+              headers: { 'User-Agent': 'Mozilla/5.0' }
+            }
+          );
+
+          const meta = response.data?.chart?.result?.[0]?.meta;
+          const value = meta?.regularMarketPrice || meta?.previousClose;
+
+          if (Number.isFinite(value) && value > 0) {
+            prices[ticker] = value;
+          }
+        } catch (_) {
+          console.error(`Yahoo price unavailable for ${ticker}.`);
+        }
+      })
+    ]);
+
+    priceCache = prices;
+    lastFetch = Date.now();
+    return priceCache;
+  })();
+
   try {
-    const r = await axios.get(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${cryptoIds}&vs_currencies=usd`,
-      { timeout: 8000 }
-    );
-    for (const [ticker, asset] of Object.entries(ASSETS)) {
-      if (asset.source === 'crypto' && r.data[asset.id]) prices[ticker] = r.data[asset.id].usd;
-    }
-  } catch (e) { console.error('CoinGecko error:', e.message); }
-
-  // Actions/ETF/Forex → Yahoo Finance (sans clé)
-  const yahooTickers = Object.entries(ASSETS).filter(([, a]) => a.source === 'yahoo');
-  for (const [ticker, asset] of yahooTickers) {
-    try {
-      const r = await axios.get(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${asset.id}?interval=1d&range=1d`,
-        { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } }
-      );
-      const meta = r.data?.chart?.result?.[0]?.meta;
-      const price = meta?.regularMarketPrice || meta?.previousClose;
-      if (price) prices[ticker] = price;
-    } catch (_) {}
+    return await fetchInFlight;
+  } finally {
+    fetchInFlight = null;
   }
-
-  priceCache = { ...priceCache, ...prices };
-  lastFetch = Date.now();
-  return priceCache;
 }
 
-// ─── BASE DE DONNÉES (CSV dans un message Discord) ───────────────────────────
 let logMessage = null;
 let dbRows = [];
+let ready = false;
+let mutationQueue = Promise.resolve();
+
+const STORAGE_MARKER = 'TF8_TRADING_CSV_V2';
 
 async function loadData(client) {
-  const ch = await client.channels.fetch(LOG_CHANNEL_ID);
-  const msgs = await ch.messages.fetch({ limit: 20 });
-  logMessage = msgs.find(m => m.author.id === client.user.id && m.content.startsWith('```csv'));
-  if (!logMessage) {
-    logMessage = await ch.send('```csv\ndiscord_id,email,capital,positions,joined_at\n```');
+  const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+
+  if (!channel?.isTextBased() || !channel.messages) {
+    throw new Error('Invalid storage channel.');
   }
-  dbRows = parseCSV(logMessage.content);
+
+  let before;
+
+  while (!logMessage) {
+    const messages = await channel.messages.fetch({
+      limit: 100,
+      ...(before ? { before } : {})
+    });
+
+    logMessage = messages.find(message =>
+      message.author.id === client.user.id &&
+      (
+        message.content === STORAGE_MARKER ||
+        message.content.startsWith('```csv')
+      )
+    );
+
+    if (logMessage || messages.size < 100) break;
+    before = messages.last().id;
+  }
+
+  if (logMessage) {
+    let raw = logMessage.content;
+
+    if (raw === STORAGE_MARKER) {
+      const attachment = logMessage.attachments.find(
+        item => item.name === 'participants.csv'
+      );
+
+      if (!attachment) {
+        throw new Error('Storage attachment missing.');
+      }
+
+      raw = (await axios.get(attachment.url, {
+        responseType: 'text',
+        timeout: 15000
+      })).data;
+    }
+
+    dbRows = parseCSV(raw);
+  } else {
+    logMessage = await channel.send(
+      '```csv\ndiscord_id,capital,positions,joined_at,starting_capital\n```'
+    );
+  }
+
+  await saveData();
 }
 
 function parseCSV(raw) {
-  const lines = raw.replace(/```csv\n/, '').replace(/\n```/, '').trim().split('\n');
-  const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue;
-    const [discord_id, email, capital, positions, joined_at] = lines[i].split(',');
-    let pos = {};
-    try { pos = positions ? JSON.parse(Buffer.from(positions, 'base64').toString()) : {}; } catch (_) {}
-    rows.push({ discord_id, email: email || '', capital: parseFloat(capital) || STARTING_CAPITAL, positions: pos, joined_at: joined_at || '' });
+  const lines = String(raw)
+    .replace(/^```csv\r?\n/, '')
+    .replace(/\r?\n```\s*$/, '')
+    .trim()
+    .split(/\r?\n/);
+
+  const header = lines.shift().replace(/^\uFEFF/, '').split(',');
+
+  for (const key of ['discord_id', 'capital', 'positions', 'joined_at']) {
+    if (!header.includes(key)) {
+      throw new Error('Invalid CSV header.');
+    }
   }
-  return rows;
+
+  return lines.filter(line => line.trim()).map(line => {
+    const cells = line.split(',');
+    const read = key => cells[header.indexOf(key)];
+    const capital = Number(read('capital'));
+    const discord_id = read('discord_id');
+
+    if (
+      !/^\d{17,20}$/.test(discord_id) ||
+      !Number.isFinite(capital) ||
+      capital < 0
+    ) {
+      throw new Error(
+        'Invalid participant record; storage was not overwritten.'
+      );
+    }
+
+    const positions = read('positions')
+      ? JSON.parse(
+          Buffer.from(read('positions'), 'base64').toString('utf8')
+        )
+      : {};
+
+    if (
+      !positions ||
+      typeof positions !== 'object' ||
+      Array.isArray(positions)
+    ) {
+      throw new Error('Invalid positions.');
+    }
+
+    for (const [ticker, position] of Object.entries(positions)) {
+      if (
+        !ASSETS[ticker] ||
+        !Number.isFinite(position.qty) ||
+        position.qty < 0 ||
+        !Number.isFinite(position.avg_price) ||
+        position.avg_price <= 0
+      ) {
+        throw new Error(
+          'Invalid stored position; storage was not overwritten.'
+        );
+      }
+    }
+
+    // Preserve the original performance baseline for legacy accounts.
+    const baseline = header.includes('starting_capital')
+      ? Number(read('starting_capital'))
+      : 10000;
+
+    if (!Number.isFinite(baseline) || baseline <= 0) {
+      throw new Error('Invalid starting capital.');
+    }
+
+    return {
+      discord_id,
+      capital,
+      positions,
+      joined_at: read('joined_at') || '',
+      starting_capital: baseline
+    };
+  });
 }
 
 async function saveData() {
-  const lines = ['discord_id,email,capital,positions,joined_at'];
-  for (const r of dbRows) {
-    const pos = Buffer.from(JSON.stringify(r.positions || {})).toString('base64');
-    lines.push(`${r.discord_id},${r.email},${r.capital.toFixed(2)},${pos},${r.joined_at}`);
+  const lines = [
+    'discord_id,capital,positions,joined_at,starting_capital'
+  ];
+
+  for (const row of dbRows) {
+    const positions = Buffer.from(
+      JSON.stringify(row.positions || {})
+    ).toString('base64');
+
+    lines.push(
+      `${row.discord_id},${row.capital},${positions},${row.joined_at},${row.starting_capital}`
+    );
   }
-  const content = '```csv\n' + lines.join('\n') + '\n```';
-  if (content.length > 1990) {
-    const ch = logMessage.channel;
-    const nm = await ch.send(content);
-    await logMessage.delete().catch(() => {});
-    logMessage = nm;
-  } else {
-    logMessage = await logMessage.edit(content);
-  }
+
+  const csv = lines.join('\n');
+  const content = '```csv\n' + csv + '\n```';
+
+  logMessage = await logMessage.edit(
+    content.length <= 2000
+      ? { content, attachments: [] }
+      : {
+          content: STORAGE_MARKER,
+          attachments: [],
+          files: [{
+            attachment: Buffer.from(csv),
+            name: 'participants.csv'
+          }]
+        }
+  );
 }
 
-function getUser(id) { return dbRows.find(r => r.discord_id === id); }
-function createUser(id, email) {
-  const u = { discord_id: id, email, capital: STARTING_CAPITAL, positions: {}, joined_at: new Date().toISOString().split('T')[0] };
-  dbRows.push(u);
-  return u;
+function getUser(id) {
+  return dbRows.find(row => row.discord_id === id);
 }
 
-// ─── CLASSEMENT ───────────────────────────────────────────────────────────────
+async function ensureUser(id) {
+  let user = getUser(id);
+
+  if (!user) {
+    user = {
+      discord_id: id,
+      capital: STARTING_CAPITAL,
+      positions: {},
+      joined_at: new Date().toISOString().split('T')[0],
+      starting_capital: STARTING_CAPITAL
+    };
+
+    dbRows.push(user);
+    await saveData();
+  }
+
+  return user;
+}
+
 async function getRanked(prices) {
   if (!prices) prices = await fetchPrices();
-  return dbRows.map(u => {
-    let inv = 0;
-    for (const [ticker, pos] of Object.entries(u.positions || {})) {
-      if (prices[ticker]) inv += pos.qty * prices[ticker];
+
+  return dbRows.map(user => {
+    let invested = 0;
+
+    for (const [ticker, position] of Object.entries(user.positions || {})) {
+      if (!prices[ticker]) {
+        throw new Error(
+          'A position price is unavailable. Please try again later.'
+        );
+      }
+
+      invested += position.qty * prices[ticker];
     }
-    return { discord_id: u.discord_id, total: u.capital + inv };
+
+    return {
+      discord_id: user.discord_id,
+      total: user.capital + invested,
+      starting_capital: user.starting_capital
+    };
   }).sort((a, b) => b.total - a.total);
 }
 
@@ -157,430 +349,820 @@ async function rankingEmbed() {
   const prices = await fetchPrices();
   const ranked = await getRanked(prices);
   const medals = ['🥇', '🥈', '🥉'];
-  const lines = ranked.slice(0, 15).map((r, i) => {
-    const pnl = r.total - STARTING_CAPITAL;
-    const pct = ((pnl / STARTING_CAPITAL) * 100).toFixed(2);
+
+  const lines = ranked.slice(0, 15).map((row, index) => {
+    const pnl = row.total - row.starting_capital;
+    const percentage = ((pnl / row.starting_capital) * 100).toFixed(2);
     const sign = pnl >= 0 ? '+' : '';
-    return `${medals[i] || `\`${i + 1}.\``} <@${r.discord_id}> — **$${r.total.toFixed(0)}** (${sign}${pct}%)`;
+
+    return `${medals[index] || `\`${index + 1}.\``} <@${row.discord_id}> - **$${row.total.toFixed(0)}** (${sign}${percentage}%)`;
   });
+
   return new EmbedBuilder()
     .setColor(0xf9a825)
-    .setTitle('🏆 Classement TF8 Trading Competition')
-    .setDescription(lines.length ? lines.join('\n') : 'Aucun participant pour l\'instant.')
-    .setFooter({ text: `${ranked.length} participants · Capital de départ $${STARTING_CAPITAL.toLocaleString()}` })
+    .setTitle('🏆 TF8 Trading Competition Rankings')
+    .setDescription(
+      lines.length ? lines.join('\n') : 'No participants yet.'
+    )
+    .setFooter({
+      text: `${ranked.length} participants · Starting cash $${STARTING_CAPITAL.toLocaleString('en-US')}`
+    })
     .setTimestamp();
 }
 
-// ─── PORTFOLIO EMBED ──────────────────────────────────────────────────────────
 async function portfolioEmbed(user, member) {
   const prices = await fetchPrices();
   let invested = 0;
-  const posLines = [];
+  const positionLines = [];
 
-  for (const [ticker, pos] of Object.entries(user.positions || {})) {
-    if (pos.qty <= 0) continue;
+  for (const [ticker, position] of Object.entries(user.positions || {})) {
+    if (position.qty <= 0) continue;
+
     const price = prices[ticker];
-    if (!price) continue;
-    const val = pos.qty * price;
-    const cost = pos.qty * pos.avg_price;
-    const pnl = val - cost;
-    const pct = ((pnl / cost) * 100).toFixed(2);
-    invested += val;
-    posLines.push(`${pnl >= 0 ? '🟢' : '🔴'} **${ticker}** · $${val.toFixed(2)} (${pnl >= 0 ? '+' : ''}${pct}%)`);
+
+    if (!price) {
+      throw new Error(
+        'A position price is unavailable. Please try again later.'
+      );
+    }
+
+    const value = position.qty * price;
+    const cost = position.qty * position.avg_price;
+    const pnl = value - cost;
+    const percentage = ((pnl / cost) * 100).toFixed(2);
+
+    invested += value;
+
+    positionLines.push(
+      `${pnl >= 0 ? '🟢' : '🔴'} **${ticker}** · $${value.toFixed(2)} (${pnl >= 0 ? '+' : ''}${percentage}%)`
+    );
   }
 
   const total = user.capital + invested;
-  const globalPnl = total - STARTING_CAPITAL;
-  const globalPct = ((globalPnl / STARTING_CAPITAL) * 100).toFixed(2);
+  const globalPnl = total - user.starting_capital;
+  const globalPercentage = (
+    (globalPnl / user.starting_capital) * 100
+  ).toFixed(2);
+
   const ranked = await getRanked(prices);
-  const rank = ranked.findIndex(r => r.discord_id === user.discord_id) + 1;
+  const rank = ranked.findIndex(
+    row => row.discord_id === user.discord_id
+  ) + 1;
 
   return new EmbedBuilder()
     .setColor(globalPnl >= 0 ? 0x00c853 : 0xff1744)
-    .setTitle(`📊 Portfolio de ${member.displayName}`)
+    .setTitle(`📊 Portfolio | ${member.displayName}`)
     .addFields(
-      { name: '💰 Capital total', value: `**$${total.toFixed(2)}**`, inline: true },
-      { name: '📈 Performance', value: `**${globalPnl >= 0 ? '+' : ''}${globalPct}%**`, inline: true },
-      { name: '🏆 Rang', value: `**#${rank}** / ${ranked.length}`, inline: true },
-      { name: '💵 Cash dispo', value: `$${user.capital.toFixed(2)}`, inline: true },
-      { name: '📦 Investi', value: `$${invested.toFixed(2)}`, inline: true },
+      {
+        name: '💰 Total balance',
+        value: `**$${total.toFixed(2)}**`,
+        inline: true
+      },
+      {
+        name: '📈 Performance',
+        value: `**${globalPnl >= 0 ? '+' : ''}${globalPercentage}%**`,
+        inline: true
+      },
+      {
+        name: '🏆 Rank',
+        value: `**#${rank}** / ${ranked.length}`,
+        inline: true
+      },
+      {
+        name: '💵 Available cash',
+        value: `$${user.capital.toFixed(2)}`,
+        inline: true
+      },
+      {
+        name: '📦 Invested',
+        value: `$${invested.toFixed(2)}`,
+        inline: true
+      },
       { name: '\u200b', value: '\u200b', inline: true },
-      { name: `Positions (${posLines.length})`, value: posLines.length ? posLines.join('\n') : '_Aucune — clique sur **💸 Acheter** pour commencer_' }
+      {
+        name: `Positions (${positionLines.length})`,
+        value: positionLines.length
+          ? positionLines.join('\n')
+          : '_No positions - click **Buy** to get started._'
+      }
     )
-    .setFooter({ text: 'TF8 Trading Competition · Prix temps réel' })
+    .setFooter({
+      text: 'TF8 Trading Competition · Market prices'
+    })
     .setTimestamp();
 }
 
-// ─── BOUTONS PRINCIPAUX ───────────────────────────────────────────────────────
+function tradingPanelEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x1565c0)
+    .setTitle('📈 TF8 Trading Competition')
+    .setDescription(
+      '**Virtual trading. Real prices. Live rankings.**\n\n' +
+      'Start with **$50,000 virtual cash** to invest across 20 real assets.\n' +
+      'BTC, ETH, Tesla, NVIDIA, S&P 500, Gold, Forex and more.\n' +
+      'Prices come from CoinGecko and Yahoo Finance. The best trader of the month wins a TF8 reward.\n\n' +
+      'Click **Portfolio**, **Buy**, or **Sell** to join automatically and start trading.'
+    )
+    .setFooter({
+      text: 'TF8 Trading Competition · Rankings posted every morning at 9 AM (Europe/Paris)'
+    });
+}
+
+async function refreshTradingPanels() {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channels = await guild.channels.fetch();
+
+  for (const channel of channels.values()) {
+    if (
+      !channel?.isTextBased() ||
+      !channel.messages ||
+      channel.id === LOG_CHANNEL_ID
+    ) continue;
+
+    let before;
+
+    try {
+      while (true) {
+        const messages = await channel.messages.fetch({
+          limit: 100,
+          ...(before ? { before } : {})
+        });
+
+        for (const message of messages.values()) {
+          if (message.author.id !== client.user.id) continue;
+
+          const ids = message.components.flatMap(
+            row => row.components.map(component => component.customId)
+          );
+
+          const panelIds = [
+            'btn_portfolio',
+            'btn_buy_menu',
+            'btn_sell_menu',
+            'btn_prices',
+            'btn_ranking'
+          ];
+
+          if (!panelIds.every(id => ids.includes(id))) continue;
+
+          await message.edit({
+            content: '',
+            embeds: [tradingPanelEmbed()],
+            components: [mainMenuRow()],
+            allowedMentions: { parse: [] }
+          });
+        }
+
+        if (messages.size < 100) break;
+        before = messages.last().id;
+      }
+    } catch (_) {
+      console.error(
+        `Unable to refresh trading panels in channel ${channel.id}. Check View Channel, Read Message History, and Send Messages permissions.`
+      );
+    }
+  }
+}
+
 function mainMenuRow() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('btn_portfolio').setLabel('📊 Portfolio').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('btn_buy_menu').setLabel('💸 Acheter').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('btn_sell_menu').setLabel('📤 Vendre').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('btn_prices').setLabel('📈 Prix').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('btn_ranking').setLabel('🏆 Classement').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder()
+      .setCustomId('btn_portfolio')
+      .setLabel('📊 Portfolio')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('btn_buy_menu')
+      .setLabel('💸 Buy')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId('btn_sell_menu')
+      .setLabel('📤 Sell')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId('btn_prices')
+      .setLabel('📈 Prices')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('btn_ranking')
+      .setLabel('🏆 Rankings')
+      .setStyle(ButtonStyle.Secondary)
   );
 }
 
 function assetSelectMenu(customId, placeholder) {
   const options = Object.entries(ASSETS).map(([ticker, asset]) => ({
-    label: `${ticker} — ${asset.name}`,
+    label: `${ticker} - ${asset.name}`,
     value: ticker
   }));
+
   return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder().setCustomId(customId).setPlaceholder(placeholder).addOptions(options)
+    new StringSelectMenuBuilder()
+      .setCustomId(customId)
+      .setPlaceholder(placeholder)
+      .addOptions(options)
   );
 }
 
-// ─── SLASH COMMANDS ADMIN ─────────────────────────────────────────────────────
 const commands = [
   new SlashCommandBuilder()
     .setName('setup-trading')
-    .setDescription('[Admin] Poster le panneau Trading Competition dans ce canal')
+    .setDescription('[Admin] Post the Trading Competition panel in this channel')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
-    .setName('classement')
-    .setDescription('[Admin] Poster le classement maintenant')
+    .setName('ranking')
+    .setDescription('[Admin] Post the rankings now')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
     .setName('reset-competition')
-    .setDescription('[Admin] Remettre tous les portfolios à zéro ($10 000)')
+    .setDescription('[Admin] Reset all portfolios to $50,000')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
-    .setName('liste-emails')
-    .setDescription('[Admin] Voir les emails des inscrits')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-  new SlashCommandBuilder()
-    .setName('gagnant')
-    .setDescription('[Admin] Afficher le gagnant de la compétition')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-].map(c => c.toJSON());
+    .setName('winner')
+    .setDescription('[Admin] Show the competition winner')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+].map(command => command.toJSON());
 
-// ─── CLIENT ──────────────────────────────────────────────────────────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMembers
   ],
   partials: [Partials.Message, Partials.Channel]
 });
 
 client.once(Events.ClientReady, async () => {
-  console.log(`✅ Connecté : ${client.user.tag}`);
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log('✅ Commandes admin enregistrées');
-  await loadData(client);
-  console.log(`✅ ${dbRows.length} participants chargés`);
-  scheduleDaily();
+  try {
+    console.log(`✅ Connected: ${client.user.tag}`);
+
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
+
+    await rest.put(
+      Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+      { body: commands }
+    );
+
+    console.log('✅ Admin commands registered');
+
+    await loadData(client);
+
+    console.log(`✅ ${dbRows.length} participants loaded`);
+
+    ready = true;
+    scheduleDaily();
+
+    refreshTradingPanels().catch(() => {
+      console.error(
+        'Unable to refresh existing trading panels. Run /setup-trading to publish the updated panel.'
+      );
+    });
+  } catch (_) {
+    console.error(
+      'Startup failed. Check configuration, channel permissions, and storage.'
+    );
+    client.destroy();
+    process.exitCode = 1;
+  }
 });
 
-// ─── INSCRIPTION PAR EMAIL ────────────────────────────────────────────────────
-client.on(Events.MessageCreate, async (msg) => {
-  if (msg.author.bot) return;
-  if (msg.channelId !== EMAIL_CHANNEL_ID) return;
-
-  const email = msg.content.trim();
-  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-
-  if (!emailOk) {
-    const r = await msg.reply('❌ Format invalide. Envoie uniquement ton adresse email (ex: `nom@gmail.com`)');
-    setTimeout(() => r.delete().catch(() => {}), 8000);
-    await msg.delete().catch(() => {});
-    return;
-  }
-
-  let user = getUser(msg.author.id);
-  if (user) {
-    user.email = email;
-    await saveData();
-    const r = await msg.reply(`✅ Email mis à jour ! Tu participes à la **TF8 Trading Competition** avec $${STARTING_CAPITAL.toLocaleString()} virtuels.`);
-    setTimeout(() => r.delete().catch(() => {}), 10000);
-  } else {
-    user = createUser(msg.author.id, email);
-    await saveData();
-    const r = await msg.reply(`🎯 **Inscription confirmée !** Tu démarres avec **$${STARTING_CAPITAL.toLocaleString()}** virtuels.\nRetourne dans le canal Trading et clique sur **📊 Portfolio** pour voir ton dashboard !`);
-    setTimeout(() => r.delete().catch(() => {}), 12000);
-  }
-  await msg.delete().catch(() => {});
-});
-
-// ─── INTERACTIONS ─────────────────────────────────────────────────────────────
-client.on(Events.InteractionCreate, async (interaction) => {
-
-  // ══ SLASH COMMANDS ══
+async function handleInteraction(interaction) {
   if (interaction.isChatInputCommand()) {
-
     if (interaction.commandName === 'setup-trading') {
-      const embed = new EmbedBuilder()
-        .setColor(0x1565c0)
-        .setTitle('📈 TF8 Trading Competition')
-        .setDescription(
-          '**Trading virtuel. Vrais prix. Vrai classement.**\n\n' +
-          'Tu démarres avec **$10 000 virtuels** à investir sur 20 actifs réels.\n' +
-          'BTC, ETH, Tesla, NVIDIA, S&P 500, Gold, Forex et bien plus.\n' +
-          'Les prix sont récupérés en temps réel. Le meilleur trader du mois remporte une récompense TF8.\n\n' +
-          `> 📧 **Étape 1** — Envoie ton email dans <#${EMAIL_CHANNEL_ID}> pour t'inscrire\n` +
-          '> 📊 **Étape 2** — Utilise les boutons ci-dessous pour trader'
-        )
-        .setFooter({ text: 'TF8 Trading Competition · Classement mis à jour chaque matin à 9h' });
+      await interaction.channel.send({
+        embeds: [tradingPanelEmbed()],
+        components: [mainMenuRow()]
+      });
 
-      await interaction.channel.send({ embeds: [embed], components: [mainMenuRow()] });
-      return interaction.reply({ content: '✅ Panneau posté.', ephemeral: true });
+      return interaction.reply({
+        content: '✅ Trading panel posted.',
+        ephemeral: true
+      });
     }
 
-    if (interaction.commandName === 'classement') {
+    if (interaction.commandName === 'ranking') {
       await interaction.deferReply();
-      return interaction.editReply({ embeds: [await rankingEmbed()] });
+      return interaction.editReply({
+        embeds: [await rankingEmbed()]
+      });
     }
 
     if (interaction.commandName === 'reset-competition') {
       await interaction.deferReply({ ephemeral: true });
-      for (const r of dbRows) { r.capital = STARTING_CAPITAL; r.positions = {}; }
+
+      for (const row of dbRows) {
+        row.capital = STARTING_CAPITAL;
+        row.positions = {};
+        row.starting_capital = STARTING_CAPITAL;
+      }
+
       await saveData();
-      return interaction.editReply({ content: `✅ ${dbRows.length} portfolios remis à zéro ($${STARTING_CAPITAL.toLocaleString()}).` });
-    }
 
-    if (interaction.commandName === 'liste-emails') {
-      await interaction.deferReply({ ephemeral: true });
-      if (!dbRows.length) return interaction.editReply({ content: 'Aucun inscrit.' });
-      const lines = dbRows.map((r, i) => `${i + 1}. <@${r.discord_id}> — \`${r.email || '—'}\` (inscrit le ${r.joined_at})`).join('\n');
-      return interaction.editReply({ content: `**${dbRows.length} inscrits :**\n${lines}` });
-    }
-
-    if (interaction.commandName === 'gagnant') {
-      await interaction.deferReply();
-      const ranked = await getRanked();
-      if (!ranked.length) return interaction.editReply({ content: 'Aucun participant.' });
-      const w = ranked[0];
-      const pnl = w.total - STARTING_CAPITAL;
-      const pct = ((pnl / STARTING_CAPITAL) * 100).toFixed(2);
       return interaction.editReply({
-        embeds: [new EmbedBuilder()
-          .setColor(0xffd700)
-          .setTitle('🏆 Gagnant de la TF8 Trading Competition !')
-          .setDescription(`🥇 <@${w.discord_id}>\n\n**Capital final : $${w.total.toFixed(2)}**\nPerformance : **+${pct}%**`)
-          .setTimestamp()]
+        content: `✅ ${dbRows.length} portfolios reset ($${STARTING_CAPITAL.toLocaleString('en-US')}).`
+      });
+    }
+
+    if (interaction.commandName === 'winner') {
+      await interaction.deferReply();
+
+      const ranked = await getRanked();
+
+      if (!ranked.length) {
+        return interaction.editReply({
+          content: 'No participants yet.'
+        });
+      }
+
+      const winner = ranked[0];
+      const pnl = winner.total - winner.starting_capital;
+      const percentage = (
+        (pnl / winner.starting_capital) * 100
+      ).toFixed(2);
+
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xffd700)
+            .setTitle('🏆 TF8 Trading Competition Winner!')
+            .setDescription(
+              `🥇 <@${winner.discord_id}>\n\n` +
+              `**Final balance: $${winner.total.toFixed(2)}**\n` +
+              `Performance: **${pnl >= 0 ? '+' : ''}${percentage}%**`
+            )
+            .setTimestamp()
+        ]
       });
     }
   }
 
-  // ══ BOUTONS ══
   if (interaction.isButton()) {
-
-    // 📊 Portfolio
     if (interaction.customId === 'btn_portfolio') {
       await interaction.deferReply({ ephemeral: true });
-      const user = getUser(interaction.user.id);
-      if (!user) return interaction.editReply({ content: `❌ Tu n'es pas inscrit. Envoie ton email dans <#${EMAIL_CHANNEL_ID}>.` });
-      return interaction.editReply({ embeds: [await portfolioEmbed(user, interaction.member)] });
+
+      const user = await ensureUser(interaction.user.id);
+
+      return interaction.editReply({
+        embeds: [await portfolioEmbed(user, interaction.member)]
+      });
     }
 
-    // 💸 Acheter → sélecteur actif
     if (interaction.customId === 'btn_buy_menu') {
-      const user = getUser(interaction.user.id);
-      if (!user) return interaction.reply({ content: `❌ Inscris-toi d'abord dans <#${EMAIL_CHANNEL_ID}>.`, ephemeral: true });
+      const user = await ensureUser(interaction.user.id);
+
       return interaction.reply({
-        content: `**Quel actif veux-tu acheter ?**\nCash disponible : **$${user.capital.toFixed(2)}**`,
-        components: [assetSelectMenu('sel_buy_asset', 'Choisir un actif…')],
+        content:
+          '**Which asset would you like to buy?**\n' +
+          `Available cash: **$${user.capital.toFixed(2)}**`,
+        components: [
+          assetSelectMenu('sel_buy_asset', 'Choose an asset...')
+        ],
         ephemeral: true
       });
     }
 
-    // 📤 Vendre → sélecteur positions
     if (interaction.customId === 'btn_sell_menu') {
-      const user = getUser(interaction.user.id);
-      if (!user) return interaction.reply({ content: `❌ Inscris-toi d'abord dans <#${EMAIL_CHANNEL_ID}>.`, ephemeral: true });
-      const openPos = Object.entries(user.positions || {}).filter(([, p]) => p.qty > 0);
-      if (!openPos.length) return interaction.reply({ content: '❌ Tu n\'as aucune position ouverte.', ephemeral: true });
-      const options = openPos.map(([t]) => ({ label: `${t} — ${ASSETS[t]?.name || t}`, value: t }));
+      const user = await ensureUser(interaction.user.id);
+      const positions = Object.entries(user.positions || {})
+        .filter(([, position]) => position.qty > 0);
+
+      if (!positions.length) {
+        return interaction.reply({
+          content: '❌ You have no open positions.',
+          ephemeral: true
+        });
+      }
+
+      const options = positions.map(([ticker]) => ({
+        label: `${ticker} - ${ASSETS[ticker]?.name || ticker}`,
+        value: ticker
+      }));
+
       return interaction.reply({
-        content: '**Quel actif veux-tu vendre ?**',
-        components: [new ActionRowBuilder().addComponents(
-          new StringSelectMenuBuilder().setCustomId('sel_sell_asset').setPlaceholder('Choisir une position…').addOptions(options)
-        )],
+        content: '**Which asset would you like to sell?**',
+        components: [
+          new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder()
+              .setCustomId('sel_sell_asset')
+              .setPlaceholder('Choose a position...')
+              .addOptions(options)
+          )
+        ],
         ephemeral: true
       });
     }
 
-    // 📈 Prix
     if (interaction.customId === 'btn_prices') {
       await interaction.deferReply({ ephemeral: true });
+
       const prices = await fetchPrices();
-      const lines = Object.entries(ASSETS).map(([t, a]) => {
-        const p = prices[t];
-        return `\`${t.padEnd(7)}\` ${a.name.padEnd(18)} ${p ? `$${p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}` : '—'}`;
+
+      const lines = Object.entries(ASSETS).map(([ticker, asset]) => {
+        const price = prices[ticker];
+
+        return `${ticker.padEnd(7)} ${asset.name.padEnd(18)} ${
+          price
+            ? `$${price.toLocaleString('en-US', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 4
+              })}`
+            : '-'
+        }`;
       });
+
       return interaction.editReply({
-        embeds: [new EmbedBuilder()
-          .setColor(0x1565c0)
-          .setTitle('📈 Prix en temps réel')
-          .setDescription('```\n' + lines.join('\n') + '\n```')
-          .setFooter({ text: 'Cache 60s · CoinGecko + Yahoo Finance' })
-          .setTimestamp()]
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x1565c0)
+            .setTitle('📈 Market Prices')
+            .setDescription('```\n' + lines.join('\n') + '\n```')
+            .setFooter({
+              text: '60-second cache · CoinGecko + Yahoo Finance'
+            })
+            .setTimestamp()
+        ]
       });
     }
 
-    // 🏆 Classement
     if (interaction.customId === 'btn_ranking') {
       await interaction.deferReply({ ephemeral: true });
-      return interaction.editReply({ embeds: [await rankingEmbed()] });
+
+      return interaction.editReply({
+        embeds: [await rankingEmbed()]
+      });
     }
 
-    // Vendre tout (bouton dynamique)
     if (interaction.customId.startsWith('sell_all_')) {
       await interaction.deferReply({ ephemeral: true });
+
       const ticker = interaction.customId.replace('sell_all_', '');
-      const user = getUser(interaction.user.id);
-      if (!user) return interaction.editReply({ content: '❌ Non inscrit.' });
-      const pos = user.positions[ticker];
-      if (!pos || pos.qty <= 0) return interaction.editReply({ content: `❌ Pas de position sur ${ticker}.` });
+      const user = await ensureUser(interaction.user.id);
+      const position = user.positions[ticker];
+
+      if (!position || position.qty <= 0) {
+        return interaction.editReply({
+          content: `❌ No open position in ${ticker}.`
+        });
+      }
+
       const prices = await fetchPrices();
       const price = prices[ticker];
-      if (!price) return interaction.editReply({ content: `❌ Prix indisponible.` });
-      const received = pos.qty * price;
+
+      if (!price) {
+        return interaction.editReply({
+          content: '❌ Price unavailable.'
+        });
+      }
+
+      const received = position.qty * price;
+
       user.capital += received;
       delete user.positions[ticker];
+
       await saveData();
-      return interaction.editReply({ content: `✅ **${ticker}** vendu entièrement pour **$${received.toFixed(2)}**\nCash total : **$${user.capital.toFixed(2)}**` });
+
+      return interaction.editReply({
+        content:
+          `✅ **${ticker}** sold in full for **$${received.toFixed(2)}**\n` +
+          `Available cash: **$${user.capital.toFixed(2)}**`
+      });
     }
 
-    // Bouton pour ouvrir modal vente partielle
     if (interaction.customId.startsWith('modal_sell_partial_')) {
-      const ticker = interaction.customId.replace('modal_sell_partial_', '');
-      const user = getUser(interaction.user.id);
-      const prices = await fetchPrices();
-      const price = prices[ticker];
-      const pos = user?.positions[ticker];
+      const ticker = interaction.customId.replace(
+        'modal_sell_partial_', ''
+      );
+
       const modal = new ModalBuilder()
         .setCustomId(`modal_sell_${ticker}`)
-        .setTitle(`Vendre ${ticker} — ${ASSETS[ticker]?.name}`)
-        .addComponents(new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('montant')
-            .setLabel(`Valeur pos. : $${(pos?.qty * (price || 0)).toFixed(2)} · Prix : $${price?.toFixed(2) || '—'}`)
-            .setPlaceholder('Montant en USD à vendre (ex: 200)')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-        ));
+        .setTitle(`Sell ${ticker}`)
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('montant')
+              .setLabel('USD amount to sell')
+              .setPlaceholder('USD amount to sell (e.g. 200)')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+          )
+        );
+
       return interaction.showModal(modal);
     }
   }
 
-  // ══ SELECT MENUS ══
   if (interaction.isStringSelectMenu()) {
-
-    // Achat : sélection actif → modal montant
     if (interaction.customId === 'sel_buy_asset') {
       const ticker = interaction.values[0];
-      const prices = await fetchPrices();
-      const price = prices[ticker];
-      const user = getUser(interaction.user.id);
+
       const modal = new ModalBuilder()
         .setCustomId(`modal_buy_${ticker}`)
-        .setTitle(`Acheter ${ticker} — ${ASSETS[ticker]?.name}`)
-        .addComponents(new ActionRowBuilder().addComponents(
-          new TextInputBuilder()
-            .setCustomId('montant')
-            .setLabel(`Prix : $${price ? price.toFixed(2) : '—'} · Cash dispo : $${user?.capital.toFixed(2) || 0}`)
-            .setPlaceholder('Montant en USD à investir (ex: 500)')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-        ));
+        .setTitle(`Buy ${ticker}`)
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('montant')
+              .setLabel('USD amount to invest')
+              .setPlaceholder('USD amount to invest (e.g. 500)')
+              .setStyle(TextInputStyle.Short)
+              .setRequired(true)
+          )
+        );
+
       return interaction.showModal(modal);
     }
 
-    // Vente : sélection actif → boutons "Tout vendre" ou "Montant précis"
     if (interaction.customId === 'sel_sell_asset') {
       const ticker = interaction.values[0];
       const user = getUser(interaction.user.id);
-      const prices = await fetchPrices();
-      const price = prices[ticker];
-      const pos = user?.positions[ticker];
-      if (!pos || pos.qty <= 0) return interaction.reply({ content: `❌ Pas de position sur ${ticker}.`, ephemeral: true });
-      const valeur = pos.qty * (price || pos.avg_price);
+      const price = priceCache[ticker];
+      const position = user?.positions[ticker];
+
+      if (!position || position.qty <= 0) {
+        return interaction.reply({
+          content: `❌ No open position in ${ticker}.`,
+          ephemeral: true
+        });
+      }
+
+      const value = position.qty * (price || position.avg_price);
+
       return interaction.reply({
-        content: `**${ticker}** · ${pos.qty.toFixed(6)} unités · valeur ≈ **$${valeur.toFixed(2)}** · prix $${price?.toFixed(2) || '—'}`,
-        components: [new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`sell_all_${ticker}`).setLabel(`Tout vendre (≈$${valeur.toFixed(0)})`).setStyle(ButtonStyle.Danger),
-          new ButtonBuilder().setCustomId(`modal_sell_partial_${ticker}`).setLabel('Vendre un montant précis').setStyle(ButtonStyle.Secondary)
-        )],
+        content:
+          `**${ticker}** · ${position.qty.toFixed(6)} units · ` +
+          `value ≈ **$${value.toFixed(2)}** · ` +
+          `price $${price?.toFixed(2) || '-'}`,
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId(`sell_all_${ticker}`)
+              .setLabel(`Sell all (≈$${value.toFixed(0)})`)
+              .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+              .setCustomId(`modal_sell_partial_${ticker}`)
+              .setLabel('Sell a specific amount')
+              .setStyle(ButtonStyle.Secondary)
+          )
+        ],
         ephemeral: true
       });
     }
   }
 
-  // ══ MODALS ══
   if (interaction.isModalSubmit()) {
-
-    // Achat
     if (interaction.customId.startsWith('modal_buy_')) {
       await interaction.deferReply({ ephemeral: true });
+
       const ticker = interaction.customId.replace('modal_buy_', '');
-      const montant = parseFloat(interaction.fields.getTextInputValue('montant'));
-      if (isNaN(montant) || montant <= 0) return interaction.editReply({ content: '❌ Montant invalide.' });
-      const user = getUser(interaction.user.id);
-      if (!user) return interaction.editReply({ content: '❌ Non inscrit.' });
-      if (user.capital < montant) return interaction.editReply({ content: `❌ Cash insuffisant. Tu as **$${user.capital.toFixed(2)}**.` });
+      const amount = Number(
+        interaction.fields.getTextInputValue('montant').trim()
+      );
+
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return interaction.editReply({
+          content: '❌ Invalid amount. Enter a positive USD amount.'
+        });
+      }
+
+      const user = await ensureUser(interaction.user.id);
+
+      if (user.capital < amount) {
+        return interaction.editReply({
+          content: `❌ Insufficient cash. You have **$${user.capital.toFixed(2)}**.`
+        });
+      }
+
       const prices = await fetchPrices();
       const price = prices[ticker];
-      if (!price) return interaction.editReply({ content: `❌ Prix indisponible pour ${ticker}.` });
-      const qty = montant / price;
-      user.capital -= montant;
-      if (!user.positions[ticker]) user.positions[ticker] = { qty: 0, avg_price: price };
-      const pos = user.positions[ticker];
-      const newQty = pos.qty + qty;
-      pos.avg_price = ((pos.qty * pos.avg_price) + (qty * price)) / newQty;
-      pos.qty = newQty;
+
+      if (!price) {
+        return interaction.editReply({
+          content: `❌ Price unavailable for ${ticker}.`
+        });
+      }
+
+      const quantity = amount / price;
+      user.capital -= amount;
+
+      if (!user.positions[ticker]) {
+        user.positions[ticker] = { qty: 0, avg_price: price };
+      }
+
+      const position = user.positions[ticker];
+      const newQuantity = position.qty + quantity;
+
+      position.avg_price = (
+        (position.qty * position.avg_price) +
+        (quantity * price)
+      ) / newQuantity;
+
+      position.qty = newQuantity;
+
       await saveData();
-      return interaction.editReply({ content: `✅ **${ticker}** acheté pour **$${montant.toFixed(2)}** à $${price.toFixed(4)}\nCash restant : **$${user.capital.toFixed(2)}**` });
+
+      return interaction.editReply({
+        content:
+          `✅ **${ticker}** bought for **$${amount.toFixed(2)}** at $${price.toFixed(4)}\n` +
+          `Remaining cash: **$${user.capital.toFixed(2)}**`
+      });
     }
 
-    // Vente partielle
     if (interaction.customId.startsWith('modal_sell_')) {
       await interaction.deferReply({ ephemeral: true });
+
       const ticker = interaction.customId.replace('modal_sell_', '');
-      const montant = parseFloat(interaction.fields.getTextInputValue('montant'));
-      if (isNaN(montant) || montant <= 0) return interaction.editReply({ content: '❌ Montant invalide.' });
-      const user = getUser(interaction.user.id);
-      if (!user) return interaction.editReply({ content: '❌ Non inscrit.' });
+      const amount = Number(
+        interaction.fields.getTextInputValue('montant').trim()
+      );
+
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return interaction.editReply({
+          content: '❌ Invalid amount. Enter a positive USD amount.'
+        });
+      }
+
+      const user = await ensureUser(interaction.user.id);
       const prices = await fetchPrices();
       const price = prices[ticker];
-      if (!price) return interaction.editReply({ content: `❌ Prix indisponible.` });
-      const pos = user.positions[ticker];
-      if (!pos || pos.qty <= 0) return interaction.editReply({ content: `❌ Pas de position sur ${ticker}.` });
-      const qtyToSell = montant / price;
-      const maxVal = pos.qty * price;
-      if (montant > maxVal + 0.01) return interaction.editReply({ content: `❌ Maximum vendable : **$${maxVal.toFixed(2)}**` });
-      pos.qty -= qtyToSell;
-      if (pos.qty < 0.000001) delete user.positions[ticker];
-      user.capital += montant;
+
+      if (!price) {
+        return interaction.editReply({
+          content: '❌ Price unavailable.'
+        });
+      }
+
+      const position = user.positions[ticker];
+
+      if (!position || position.qty <= 0) {
+        return interaction.editReply({
+          content: `❌ No open position in ${ticker}.`
+        });
+      }
+
+      const quantityToSell = amount / price;
+      const maxValue = position.qty * price;
+
+      if (amount > maxValue) {
+        return interaction.editReply({
+          content: `❌ Maximum sell value: **$${maxValue.toFixed(2)}**`
+        });
+      }
+
+      position.qty -= quantityToSell;
+
+      if (position.qty <= Number.EPSILON) {
+        delete user.positions[ticker];
+      }
+
+      user.capital += amount;
+
       await saveData();
-      return interaction.editReply({ content: `✅ **${ticker}** vendu pour **$${montant.toFixed(2)}**\nCash total : **$${user.capital.toFixed(2)}**` });
+
+      return interaction.editReply({
+        content:
+          `✅ **${ticker}** sold for **$${amount.toFixed(2)}**\n` +
+          `Available cash: **$${user.capital.toFixed(2)}**`
+      });
     }
+  }
+}
+
+client.on(Events.InteractionCreate, async interaction => {
+  if (interaction.guildId !== GUILD_ID) return;
+
+  if (!ready) {
+    return interaction.reply({
+      content: 'The bot is starting. Please try again shortly.',
+      ephemeral: true
+    });
+  }
+
+  if (
+    interaction.isChatInputCommand() &&
+    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+  ) {
+    return interaction.reply({
+      content: 'Administrator permission is required.',
+      ephemeral: true
+    });
+  }
+
+  const opensModal =
+    (
+      interaction.isStringSelectMenu() &&
+      interaction.customId === 'sel_buy_asset'
+    ) ||
+    (
+      interaction.isButton() &&
+      interaction.customId.startsWith('modal_sell_partial_')
+    );
+
+  const run = async () => {
+    const snapshot = JSON.stringify(dbRows);
+
+    try {
+      await handleInteraction(interaction);
+    } catch (_) {
+      dbRows = JSON.parse(snapshot);
+
+      console.error(
+        'Interaction failed. Check storage permissions and market data availability.'
+      );
+
+      const payload = {
+        content: 'Unable to complete this action. Please try again shortly.',
+        components: [],
+        embeds: []
+      };
+
+      try {
+        if (interaction.deferred) {
+          await interaction.editReply(payload);
+        } else if (!interaction.replied) {
+          await interaction.reply({ ...payload, ephemeral: true });
+        }
+      } catch (_) {}
+    }
+  };
+
+  try {
+    if (opensModal) {
+      if (!getUser(interaction.user.id)) {
+        return interaction.reply({
+          content: 'Click Portfolio or Buy to start trading.',
+          ephemeral: true
+        });
+      }
+
+      await run();
+    } else {
+      const publicReply =
+        interaction.isChatInputCommand() &&
+        ['ranking', 'winner'].includes(interaction.commandName);
+
+      await interaction.deferReply({ ephemeral: !publicReply });
+
+      interaction.deferReply = async () => {};
+      interaction.reply = payload => interaction.editReply(payload);
+
+      mutationQueue = mutationQueue.then(run, run);
+      await mutationQueue;
+    }
+  } catch (_) {
+    console.error('Unable to acknowledge interaction.');
   }
 });
 
-// ─── CLASSEMENT AUTO 9H PARIS ─────────────────────────────────────────────────
 function scheduleDaily() {
-  const now = new Date();
-  const next = new Date();
-  next.setHours(9, 0, 0, 0);
-  if (next <= now) next.setDate(next.getDate() + 1);
-  const delay = next - now;
-  setTimeout(async () => {
-    const post = async () => {
+  let lastPostedDate = '';
+
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Paris',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  });
+
+  setInterval(() => {
+    const parts = Object.fromEntries(
+      formatter.formatToParts(new Date())
+        .map(part => [part.type, part.value])
+    );
+
+    const date = `${parts.year}-${parts.month}-${parts.day}`;
+
+    if (
+      parts.hour !== '09' ||
+      parts.minute !== '00' ||
+      date === lastPostedDate
+    ) return;
+
+    lastPostedDate = date;
+
+    mutationQueue = mutationQueue.then(async () => {
       try {
-        const ch = await client.channels.fetch(RANK_CHANNEL_ID);
-        await ch.send({ content: '☀️ **Classement du matin !**', embeds: [await rankingEmbed()] });
-      } catch (e) { console.error('Erreur classement auto:', e); }
-    };
-    await post();
-    setInterval(post, 24 * 60 * 60 * 1000);
-  }, delay);
-  console.log(`✅ Classement auto dans ${Math.round(delay / 60000)} min`);
+        const channel = await client.channels.fetch(RANK_CHANNEL_ID);
+
+        await channel.send({
+          content: '☀️ **Morning Rankings!**',
+          embeds: [await rankingEmbed()],
+          allowedMentions: { parse: [] }
+        });
+      } catch (_) {
+        console.error(
+          'Daily ranking failed. Check channel permissions and price availability.'
+        );
+      }
+    });
+  }, 15000);
+
+  console.log('Daily rankings scheduled for 9 AM Europe/Paris.');
 }
 
-client.login(TOKEN);
+client.login(TOKEN).catch(() => {
+  console.error('Discord login failed. Check TOKEN.');
+  process.exitCode = 1;
+});
